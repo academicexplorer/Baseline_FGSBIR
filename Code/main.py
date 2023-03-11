@@ -1,3 +1,4 @@
+import os
 import torch
 import time
 from model import FGSBIR_Model
@@ -5,7 +6,11 @@ from dataset import get_dataloader
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 import argparse
 
-
+# PyTorch Lightning Modules
+from pytorch_lightning import Trainer
+from pytorch_lightning.loggers import WandbLogger
+from pytorch_lightning.callbacks import ModelCheckpoint
+from pytorch_lightning.profilers import SimpleProfiler
 
 
 if __name__ == "__main__":
@@ -28,29 +33,30 @@ if __name__ == "__main__":
     dataloader_Train, dataloader_Test = get_dataloader(hp)
     print(hp)
 
+    exp_name = '%s-%s'%(hp.backbone_name, hp.dataset_name)
+    logger = WandbLogger(project="Baseline FGSBIR", name=exp_name)
 
-    model = FGSBIR_Model(hp)
-    model.to(device)
-    # model.load_state_dict(torch.load('VGG_ShoeV2_model_best.pth', map_location=device))
-    step_count, top1, top10 = -1, 0, 0
+    checkpoint_callback = ModelCheckpoint(
+        monitor='top1', mode='max', dirpath=exp_name,
+        filename=hp.backbone_name, save_last=True)
+    
+    if os.path.exists(os.path.join(exp_name, hp.backbone_name, 'last.ckpt')):
+        ckpt_path = os.path.join(exp_name, hp.backbone_name, 'last.ckpt')
+        model = FGSBIR_Model(hp).load_from_checkpoint(
+            checkpoint_path=ckpt_path)
+    else:
+        model = FGSBIR_Model(hp)
+        ckpt_path = None
 
-    for i_epoch in range(hp.max_epoch):
-        for batch_data in dataloader_Train:
-            step_count = step_count + 1
-            start = time.time()
-            model.train()
-            loss = model.train_model(batch=batch_data)
+    profiler = SimpleProfiler(
+        dirpath=os.path.join(exp_name, hp.dataset_name),
+        filename='perf-logs')
+    
+    trainer = Trainer(logger=logger,
+        accelerator='gpu', devices=1, accumulate_grad_batches=None,
+        benchmark=False, deterministic=False, detect_anomaly=False,
+        callbacks=[checkpoint_callback], check_val_every_n_epoch=1,
+        log_every_n_steps=10, overfit_batches=0.0, limit_val_batches=1.0,
+        max_epochs=hp.max_epoch, enable_model_summary=True, profiler=profiler)
 
-            if step_count % hp.print_freq_iter == 0:
-                print('Epoch: {}, Iteration: {}, Loss: {:.5f}, Top1_Accuracy: {:.5f}, Top10_Accuracy: {:.5f}, Time: {}'.format
-                      (i_epoch, step_count, loss, top1, top10, time.time()-start))
-
-            if step_count % hp.eval_freq_iter == 0:
-                with torch.no_grad():
-                    top1_eval, top10_eval = model.evaluate(dataloader_Test)
-                    print('results : ', top1_eval, ' / ', top10_eval)
-
-                if top1_eval > top1:
-                    torch.save(model.state_dict(), hp.backbone_name + '_' + hp.dataset_name + '_model_best.pth')
-                    top1, top10 = top1_eval, top10_eval
-                    print('Model Updated')
+    trainer.fit(model, dataloader_Train, dataloader_Test, ckpt_path=ckpt_path)
